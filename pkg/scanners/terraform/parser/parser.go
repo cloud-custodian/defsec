@@ -246,6 +246,20 @@ func (p *Parser) ParseFS(ctx context.Context, dir string) error {
 	return nil
 }
 
+func (p *Parser) GetInputVars() (map[string]cty.Value, error) {
+	if p.moduleBlock != nil {
+		inputVars := p.moduleBlock.Values().AsValueMap()
+		p.debug.Log("Added %d input variables from module definition.", len(inputVars))
+		return inputVars, nil
+	}
+	inputVars, err := loadTFVars(p.moduleFS, p.tfvarsPaths)
+	if err != nil {
+		return nil, err
+	}
+	p.debug.Log("Added %d variables from tfvars.", len(inputVars))
+	return inputVars, nil
+}
+
 func (p *Parser) EvaluateAll(ctx context.Context) (terraform.Modules, cty.Value, error) {
 
 	p.debug.Log("Evaluating module...")
@@ -263,16 +277,9 @@ func (p *Parser) EvaluateAll(ctx context.Context) (terraform.Modules, cty.Value,
 
 	p.metrics.Counts.Blocks = len(blocks)
 
-	var inputVars map[string]cty.Value
-	if p.moduleBlock != nil {
-		inputVars = p.moduleBlock.Values().AsValueMap()
-		p.debug.Log("Added %d input variables from module definition.", len(inputVars))
-	} else {
-		inputVars, err = loadTFVars(p.moduleFS, p.tfvarsPaths)
-		if err != nil {
-			return nil, cty.NilVal, err
-		}
-		p.debug.Log("Added %d variables from tfvars.", len(inputVars))
+	inputVars, err := p.GetInputVars()
+	if err != nil {
+		return nil, cty.NilVal, err
 	}
 
 	modulesMetadata, metadataPath, err := loadModuleMetadata(p.moduleFS, p.projectRoot)

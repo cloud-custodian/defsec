@@ -101,6 +101,7 @@ func (e *evaluator) evaluateStep() {
 
 	e.ctx.Set(e.getValuesByBlockType("data"), "data")
 	e.ctx.Set(e.getValuesByBlockType("output"), "output")
+	e.ctx.Set(e.getValuesByBlockType("module"), "module")
 }
 
 // exportOutputs is used to export module outputs to the parent module
@@ -127,66 +128,37 @@ func (e *evaluator) EvaluateAll(ctx context.Context) (terraform.Modules, map[str
 
 	var parseDuration time.Duration
 
-	var lastContext hcl.EvalContext
 	start := time.Now()
 	e.debug.Log("Starting module evaluation...")
-	for i := 0; i < maxContextIterations; i++ {
-
-		e.evaluateStep()
-
-		// if ctx matches the last evaluation, we can bail, nothing left to resolve
-		if i > 0 && reflect.DeepEqual(lastContext.Variables, e.ctx.Inner().Variables) {
-			break
-		}
-
-		if len(e.ctx.Inner().Variables) != len(lastContext.Variables) {
-			lastContext.Variables = make(map[string]cty.Value, len(e.ctx.Inner().Variables))
-		}
-		for k, v := range e.ctx.Inner().Variables {
-			lastContext.Variables[k] = v
-		}
-	}
+	e.evaluateSteps()
 
 	// expand out resources and modules via count (not a typo, we do this twice so every order is processed)
 	e.blocks = e.expandBlocks(e.blocks)
 	e.blocks = e.expandBlocks(e.blocks)
 
-	parseDuration += time.Since(start)
-
 	e.debug.Log("Starting submodule evaluation...")
-	var modules terraform.Modules
-	for _, definition := range e.loadModules(ctx) {
-		submodules, outputs, err := definition.Parser.EvaluateAll(ctx)
-		if err != nil {
-			e.debug.Log("Failed to evaluate submodule '%s': %s.", definition.Name, err)
-			continue
+	var smis []*submoduleInfo
+	for _, md := range e.loadModules(ctx) {
+		smis = append(smis, &submoduleInfo{definition: md})
+	}
+	for i := 0; i < maxContextIterations; i++ {
+		changed := false
+		for _, smi := range smis {
+			changed = changed || e.evaluateSubmodule(ctx, smi)
 		}
-		// export module outputs
-		e.ctx.Set(outputs, "module", definition.Name)
-		modules = append(modules, submodules...)
-		for key, val := range definition.Parser.GetFilesystemMap() {
+		if !changed {
+			e.debug.Log("submodules quiesced at i=%d", i)
+			break
+		}
+	}
+	var modules terraform.Modules
+	for _, smi := range smis {
+		modules = append(modules, smi.modules...)
+		for key, val := range smi.definition.Parser.GetFilesystemMap() {
 			fsMap[key] = val
 		}
 	}
 	e.debug.Log("Finished processing %d submodule(s).", len(modules))
-
-	e.debug.Log("Starting post-submodule evaluation...")
-	for i := 0; i < maxContextIterations; i++ {
-
-		e.evaluateStep()
-
-		// if ctx matches the last evaluation, we can bail, nothing left to resolve
-		if i > 0 && reflect.DeepEqual(lastContext.Variables, e.ctx.Inner().Variables) {
-			break
-		}
-
-		if len(e.ctx.Inner().Variables) != len(lastContext.Variables) {
-			lastContext.Variables = make(map[string]cty.Value, len(e.ctx.Inner().Variables))
-		}
-		for k, v := range e.ctx.Inner().Variables {
-			lastContext.Variables[k] = v
-		}
-	}
 
 	e.debug.Log("Module evaluation complete.")
 	parseDuration += time.Since(start)
@@ -196,6 +168,72 @@ func (e *evaluator) EvaluateAll(ctx context.Context) (terraform.Modules, map[str
 		m.SetParent(rootModule)
 	}
 	return append(terraform.Modules{rootModule}, modules...), fsMap, parseDuration
+}
+
+func (e *evaluator) evaluateSteps() {
+	var lastContext hcl.EvalContext
+	for i := 0; i < maxContextIterations; i++ {
+
+		e.evaluateStep()
+
+		// if ctx matches the last evaluation, we can bail, nothing left to resolve
+		if i > 0 && reflect.DeepEqual(lastContext.Variables, e.ctx.Inner().Variables) {
+			break
+		}
+
+		if len(e.ctx.Inner().Variables) != len(lastContext.Variables) {
+			lastContext.Variables = make(map[string]cty.Value, len(e.ctx.Inner().Variables))
+		}
+		for k, v := range e.ctx.Inner().Variables {
+			lastContext.Variables[k] = v
+		}
+	}
+}
+
+type submoduleInfo struct {
+	definition  *ModuleDefinition
+	lastInputs  map[string]cty.Value
+	lastOutputs cty.Value
+	modules     terraform.Modules
+}
+
+func (e *evaluator) evaluateSubmodule(ctx context.Context, smi *submoduleInfo) bool {
+	e.debug.Log("Considering submodule %s", smi.definition.Name)
+	inputs, err := smi.definition.Parser.GetInputVars()
+	if err != nil {
+		e.debug.Log("Failed to determine inputs for submodule %s", smi.definition.Name)
+		return false
+	}
+	if len(smi.modules) > 0 {
+		if reflect.DeepEqual(inputs, smi.lastInputs) {
+			e.debug.Log("No need to re-evaluate submodule %s", smi.definition.Name)
+			return false
+		}
+	}
+	smi.lastInputs = inputs
+
+	e.debug.Log("Evaluating submodule %s", smi.definition.Name)
+	submodules, outputs, err := smi.definition.Parser.EvaluateAll(ctx)
+	if err != nil {
+		e.debug.Log("Failed to evaluate submodule '%s': %s.", smi.definition.Name, err)
+		return false
+	}
+	smi.modules = submodules
+
+	// export module outputs
+	e.ctx.Set(outputs, "module", smi.definition.Name)
+	e.debug.Log("Submodule %s complete", smi.definition.Name)
+
+	lastOutputs := smi.lastOutputs
+	smi.lastOutputs = outputs
+	if reflect.DeepEqual(outputs, lastOutputs) {
+		e.debug.Log("Submodule %s outputs unchanged", smi.definition.Name)
+		return false
+	}
+
+	e.debug.Log("Submodule %s outputs changed", smi.definition.Name)
+	e.evaluateSteps()
+	return true
 }
 
 func (e *evaluator) expandBlocks(blocks terraform.Blocks) terraform.Blocks {
